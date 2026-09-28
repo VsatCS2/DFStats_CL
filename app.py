@@ -45,6 +45,8 @@ import sqlite3
 import time
 from collections import defaultdict, deque
 from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
+from typing import Optional
 
 from fastapi import FastAPI, Header, HTTPException, Request
 from pydantic import BaseModel, Field, field_validator
@@ -120,6 +122,22 @@ def _enforce_rate_limit(bucket: str, identifier: str):
     dq.append(now)
 
 
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _utc_today() -> str:
+    """The daily leaderboard's day: a UTC calendar date, the same moment of
+    reset for every player wherever they are."""
+    return _utc_now().strftime("%Y-%m-%d")
+
+
+def _next_reset_iso() -> str:
+    nxt = (_utc_now() + timedelta(days=1)).replace(
+        hour=0, minute=0, second=0, microsecond=0)
+    return nxt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 def _client_ip(request: Request) -> str:
     return request.client.host if request.client else "unknown"
 
@@ -137,6 +155,17 @@ def db():
         conn.commit()
     finally:
         conn.close()
+
+
+_DAILY_COLUMNS = [
+    ("daily_date", "TEXT"),                       # UTC date these daily numbers are for
+    ("daily_net_income", "INTEGER NOT NULL DEFAULT 0"),
+    ("daily_matches", "INTEGER NOT NULL DEFAULT 0"),
+    ("daily_wins", "INTEGER NOT NULL DEFAULT 0"),
+    ("daily_losses", "INTEGER NOT NULL DEFAULT 0"),
+    ("daily_best_map", "TEXT"),
+    ("daily_best_operator", "TEXT"),
+]
 
 
 def init_db():
@@ -166,6 +195,14 @@ def init_db():
                 updated_at TEXT NOT NULL
             )
         """)
+        # Daily-leaderboard columns, added to existing databases in place
+        # (the Railway volume means there IS an existing database to keep).
+        # Checked column by column rather than "if the table is old", so it
+        # is safe to run on every start and to re-run after a partial one.
+        have = {r[1] for r in conn.execute("PRAGMA table_info(stats)")}
+        for name, decl in _DAILY_COLUMNS:
+            if name not in have:
+                conn.execute(f"ALTER TABLE stats ADD COLUMN {name} {decl}")
 
 
 init_db()
@@ -274,7 +311,22 @@ class StatsPayload(BaseModel):
     best_operator: str = Field("", max_length=64)
     rank_label: str = Field("", max_length=64)
 
-    @field_validator("best_map", "best_operator", "rank_label", mode="before")
+    # Today's totals, for the daily leaderboard. Optional: older desktop
+    # builds don't send them and their sync must keep working untouched.
+    # daily_date is the UTC date the client computed them for; the server
+    # only accepts them if that is still its own "today" (see sync_stats).
+    # The daily net cap is far below the all-time one - a real day's net
+    # is a small fraction of it, so this only keeps absurd values off the board.
+    daily_date: Optional[str] = Field(None, pattern=r"^\d{4}-\d{2}-\d{2}$")
+    daily_net_income: int = Field(0, ge=-2_000_000_000, le=2_000_000_000)
+    daily_matches: int = Field(0, ge=0, le=5_000)
+    daily_wins: int = Field(0, ge=0, le=5_000)
+    daily_losses: int = Field(0, ge=0, le=5_000)
+    daily_best_map: str = Field("", max_length=64)
+    daily_best_operator: str = Field("", max_length=64)
+
+    @field_validator("best_map", "best_operator", "rank_label",
+                     "daily_best_map", "daily_best_operator", mode="before")
     @classmethod
     def _clean_text(cls, v):
         return "".join(ch for ch in (v or "").strip() if ch.isprintable())[:64]
@@ -321,7 +373,21 @@ def sync_stats(payload: StatsPayload, request: Request,
              payload.wins, payload.losses, payload.win_rate,
              payload.best_map, payload.best_operator, payload.rank_label, now),
         )
-    return {"ok": True}
+        # A stale or wrong-clock date is ignored rather than stored: it
+        # would either never show (yesterday) or sit on tomorrow's board.
+        daily_accepted = (payload.daily_date is not None
+                          and payload.daily_date == _utc_today())
+        if daily_accepted:
+            conn.execute(
+                """UPDATE stats SET daily_date=?, daily_net_income=?,
+                       daily_matches=?, daily_wins=?, daily_losses=?,
+                       daily_best_map=?, daily_best_operator=?
+                   WHERE user_id=?""",
+                (payload.daily_date, payload.daily_net_income,
+                 payload.daily_matches, payload.daily_wins,
+                 payload.daily_losses, payload.daily_best_map,
+                 payload.daily_best_operator, u["id"]))
+    return {"ok": True, "daily_accepted": daily_accepted}
 
 
 @app.post("/opt-in")
@@ -357,12 +423,51 @@ _SORT_COLUMNS = {
     "win_rate": "s.win_rate",
 }
 
+_DAILY_WIN_RATE = ("(CASE WHEN s.daily_matches > 0 "
+                   "THEN 100.0 * s.daily_wins / s.daily_matches ELSE 0 END)")
+_DAILY_SORT_COLUMNS = {
+    "net_income": "s.daily_net_income",
+    "matches": "s.daily_matches",
+    "win_rate": _DAILY_WIN_RATE,
+}
+
 
 @app.get("/leaderboard")
-def leaderboard(request: Request, sort: str = "net_income", limit: int = 50):
+def leaderboard(request: Request, sort: str = "net_income", limit: int = 50,
+                period: str = "all"):
+    """period=all (default, exactly what older desktop builds expect) or
+    period=daily: only players who opted in AND have played today (UTC),
+    ranked on today's numbers alone. Daily rows use the field names
+    net_income/matches/wins/losses/win_rate/best_map/best_operator - the
+    values are today's, not all-time."""
     _enforce_rate_limit("read", _client_ip(request))
-    sort_col = _SORT_COLUMNS.get(sort, _SORT_COLUMNS["net_income"])
     limit = max(1, min(limit, 200))
+
+    if period == "daily":
+        sort_col = _DAILY_SORT_COLUMNS.get(sort, _DAILY_SORT_COLUMNS["net_income"])
+        today = _utc_today()
+        with db() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT u.display_name, s.daily_net_income AS net_income,
+                       s.daily_matches AS matches, s.daily_wins AS wins,
+                       s.daily_losses AS losses,
+                       ROUND({_DAILY_WIN_RATE}, 1) AS win_rate,
+                       s.daily_best_map AS best_map,
+                       s.daily_best_operator AS best_operator,
+                       s.rank_label, s.updated_at
+                FROM users u
+                JOIN stats s ON s.user_id = u.id
+                WHERE u.opted_in = 1 AND s.daily_date = ? AND s.daily_matches > 0
+                ORDER BY {sort_col} DESC
+                LIMIT ?
+                """,
+                (today, limit),
+            ).fetchall()
+        return {"period": "daily", "day": today, "resets_at": _next_reset_iso(),
+                "sort": sort, "players": [dict(r) for r in rows]}
+
+    sort_col = _SORT_COLUMNS.get(sort, _SORT_COLUMNS["net_income"])
     with db() as conn:
         rows = conn.execute(
             f"""
@@ -377,7 +482,7 @@ def leaderboard(request: Request, sort: str = "net_income", limit: int = 50):
             """,
             (limit,),
         ).fetchall()
-    return {"sort": sort, "players": [dict(r) for r in rows]}
+    return {"period": "all", "sort": sort, "players": [dict(r) for r in rows]}
 
 
 @app.get("/")
@@ -393,7 +498,7 @@ def health():
 # host's dashboard). If you serve a static version.json from GitHub instead
 # (UPDATE_INFO_URL in delta_force_community.py), this endpoint goes unused
 # and is harmless. Changing an environment variable restarts the service.
-CURRENT_VERSION = os.environ.get("LATEST_VERSION", "1.1.0")
+CURRENT_VERSION = os.environ.get("LATEST_VERSION", "1.2.0")
 DOWNLOAD_URL = os.environ.get("DOWNLOAD_URL", "")  # e.g. https://github.com/you/repo/releases/latest
 
 
