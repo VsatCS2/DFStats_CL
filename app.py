@@ -49,7 +49,31 @@ from contextlib import contextmanager
 from fastapi import FastAPI, Header, HTTPException, Request
 from pydantic import BaseModel, Field, field_validator
 
-DATABASE_PATH = os.environ.get("DATABASE_PATH", "./community.db")
+# Where the SQLite file lives, in order of precedence:
+#   1. DATABASE_PATH, if set explicitly.
+#   2. A Railway volume, if one is attached. Railway sets
+#      RAILWAY_VOLUME_MOUNT_PATH by itself for a service that has a volume,
+#      so attaching a volume is all it takes for data to survive deploys.
+#   3. ./community.db - local development. On most hosts that is erased
+#      whenever the service redeploys or restarts.
+_VOLUME_PATH = os.environ.get("RAILWAY_VOLUME_MOUNT_PATH", "")
+DATABASE_PATH = (
+    os.environ.get("DATABASE_PATH")
+    or (os.path.join(_VOLUME_PATH, "community.db") if _VOLUME_PATH else "./community.db")
+)
+IS_ON_VOLUME = bool(_VOLUME_PATH) and os.path.abspath(DATABASE_PATH).startswith(
+    os.path.abspath(_VOLUME_PATH) + os.sep)
+_ON_RAILWAY = any(k.startswith("RAILWAY_") for k in os.environ)
+
+os.makedirs(os.path.dirname(os.path.abspath(DATABASE_PATH)), exist_ok=True)
+if _ON_RAILWAY and not IS_ON_VOLUME:
+    # Loud on purpose: this is the one misconfiguration that looks
+    # completely fine until the first redeploy silently empties the leaderboard.
+    print("[community] WARNING: running on Railway but the database is NOT on a "
+          f"volume ({DATABASE_PATH}). It will be ERASED on every deploy. "
+          "Attach a volume to this service - see README.", flush=True)
+else:
+    print(f"[community] database: {DATABASE_PATH} (on a volume: {IS_ON_VOLUME})", flush=True)
 
 app = FastAPI(title="Delta Force Tracker Community API")
 
@@ -358,15 +382,17 @@ def leaderboard(request: Request, sort: str = "net_income", limit: int = 50):
 
 @app.get("/")
 def health():
-    return {"ok": True, "service": "delta-force-tracker-community"}
+    # database_on_volume lets you confirm from a browser that a Railway
+    # volume is really attached, without digging through logs.
+    return {"ok": True, "service": "delta-force-tracker-community",
+            "database_on_volume": IS_ON_VOLUME}
 
 
-# Set LATEST_VERSION and DOWNLOAD_URL as environment variables in the
-# Render dashboard (Environment tab) - the desktop app polls /version on
-# startup to show an update notice. Environment variables rather than
-# constants so a release is a settings change, not a code edit. Note that
-# on Render, saving an environment variable restarts the service, and a
-# restart wipes the free-tier SQLite database (see README).
+# Optional: the desktop app can read its latest-version info from here
+# (set LATEST_VERSION and DOWNLOAD_URL as environment variables in your
+# host's dashboard). If you serve a static version.json from GitHub instead
+# (UPDATE_INFO_URL in delta_force_community.py), this endpoint goes unused
+# and is harmless. Changing an environment variable restarts the service.
 CURRENT_VERSION = os.environ.get("LATEST_VERSION", "1.1.0")
 DOWNLOAD_URL = os.environ.get("DOWNLOAD_URL", "")  # e.g. https://github.com/you/repo/releases/latest
 
@@ -375,3 +401,4 @@ DOWNLOAD_URL = os.environ.get("DOWNLOAD_URL", "")  # e.g. https://github.com/you
 def version(request: Request):
     _enforce_rate_limit("read", _client_ip(request))
     return {"latest_version": CURRENT_VERSION, "download_url": DOWNLOAD_URL}
+
