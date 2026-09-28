@@ -47,40 +47,35 @@ curl -X POST http://localhost:8000/stats/sync \
 curl http://localhost:8000/leaderboard
 ```
 
-## 2. Deploy it somewhere with a stable URL
+## 2. Deploy it on Railway (what this project uses)
 
-Pricing on all of these shifts often, so this is current as of when this
-was last checked (Sept 2026) — verify against the platform's own pricing
-page before committing, especially the free-tier claims.
+Railway (https://railway.com) has no sleeping and real persistent volumes,
+which is exactly what a SQLite-backed leaderboard needs. Pricing shifts, so
+check railway.com/pricing; at time of writing the Hobby plan is $5/month
+and includes $5 of usage, which a service this small should stay inside.
 
-**Render** (https://render.com) — the easiest genuinely-free path, no
-card required. Push this repo to GitHub, then on Render: New -> Web
-Service -> connect the repo -> set Root Directory to `server` -> it
-detects the `Dockerfile` automatically -> pick the Free instance type.
-You'll get a `*.onrender.com` URL.
+1. Put `app.py`, `requirements.txt` and `railway.toml` at the **root** of a
+   GitHub repo.
+2. Railway -> New Project -> Deploy from GitHub repo -> pick that repo.
+   `railway.toml` supplies the start command
+   (`uvicorn app:app --host 0.0.0.0 --port $PORT`), so nothing else to set.
+3. Add a **Volume** to the service (right-click the project canvas, or
+   Ctrl/Cmd+K -> Volume), attach it to the service, mount path `/data`.
+   The server finds it automatically through `RAILWAY_VOLUME_MOUNT_PATH`
+   - no environment variables needed.
+4. Service -> Settings -> Networking -> **Generate Domain**.
+5. Open `https://<your-domain>/` in a browser. You want to see
+   `"database_on_volume": true`. If it says `false`, the volume isn't
+   attached and everything will be erased on the next deploy (the deploy
+   log says so loudly too).
 
-The tradeoff: Render's free tier has **no persistent disk**, so the
-SQLite file can be wiped on redeploys or restarts — fine for trying
-this out, less fine if losing everyone's registration would actually be
-annoying. Two ways around that once it matters: upgrade just that
-service to Render's Starter tier (~$7/mo at time of writing) for
-persistent disk with no code changes, or use Fly.io from the start
-(below).
+Test persistence once before you rely on it: join the leaderboard from the
+desktop app, trigger a redeploy from the Railway dashboard, and confirm you
+are still on the leaderboard afterwards.
 
-**Fly.io** (https://fly.io) — no free tier anymore (a 2-hour trial, then
-a card is required), but genuinely cheap and gives real persistent
-storage immediately: a small always-on machine plus a 1GB volume runs
-roughly $2-3/month. `fly launch` in this folder picks up the
-`Dockerfile`; `fly volumes create data --size 1` then mount it at
-`/data` in the generated `fly.toml`; `fly deploy`.
-
-**Your own VPS** (DigitalOcean, Hetzner, etc., roughly $4-6/mo) —
-`docker build -t df-community . && docker run -d -p 8000:8000 -v $(pwd)/data:/data df-community`,
-then put a reverse proxy (Caddy or nginx) in front if you want HTTPS.
-(Unlike an OAuth-based setup, HTTPS isn't strictly required for this to
-function — there's no redirect URI that has to match a registered value
-— but it's still good practice for anything reachable from the internet.)
-Comparable cost to Fly.io, more manual setup, full control.
+Other hosts work too (any host with a persistent disk): set `DATABASE_PATH`
+to a file on that disk. Render's free tier does **not** keep the disk,
+which is why this project moved off it.
 
 ## 3. Point the desktop app at it
 
