@@ -85,7 +85,12 @@ def _limited(ip) -> bool:
 
 @app.get("/health")
 def health():
-    return jsonify(ok=True, configured=bool(UPSTREAM and SECRET))
+    # No secrets here: just enough to see how the proxy is configured.
+    auth = (next(iter(auth_headers(UPSTREAM, "x"))) if UPSTREAM else "")
+    return jsonify(ok=True, configured=bool(UPSTREAM and SECRET),
+                   version=3, upstream_host=urlparse(UPSTREAM).netloc,
+                   auth="rapidapi" if auth == "x-rapidapi-key" else "x-secret",
+                   daily_cap=DAILY_CAP, upstream_calls_today=_daily["n"])
 
 
 @app.post("/v1/call")
