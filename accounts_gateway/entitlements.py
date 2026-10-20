@@ -6,7 +6,12 @@ from datetime import datetime, timezone
 TIERS = ("free", "pro")
 TIER_RANK = {t: i for i, t in enumerate(TIERS)}
 
-# Used to seed an empty database, and as a safe fallback if the table is empty.
+# Switches the app may read WITHOUT signing in (served by GET /v1/flags). Keep
+# this list tiny and harmless: it is public.
+PUBLIC_FLAGS = ("email_login",)
+
+# Used to seed the database, and as a safe fallback if the table is empty.
+# Missing built-ins are added at startup; existing rows are never overwritten.
 DEFAULT_FEATURES = [
     dict(key="player_lookup", label="Player lookup",
          description="Look up any player by name (search, overlay and page). "
@@ -18,7 +23,12 @@ DEFAULT_FEATURES = [
     dict(key="community", label="Community leaderboard",
          description="Join and browse the community leaderboard.",
          min_tier="free", enabled=True, free_limit=None, pro_limit=None, sort=30),
+    dict(key="email_login", label="Email login",
+         description="Shows 'Log In (email)' in the app. Keep OFF until Level Infinite has "
+                     "approved it. Switching it off hides the option for everyone.",
+         min_tier="free", enabled=False, free_limit=None, pro_limit=None, sort=90),
 ]
+BUILTIN_KEYS = tuple(f["key"] for f in DEFAULT_FEATURES)
 
 
 def parse_ts(value):
