@@ -477,4 +477,7 @@ def create_app(settings, store=None, verifier=None, upstream=None, clock=time.ti
     def a_audit(request: Request, limit: int = 100):
         return {"audit": store.list_audit(min(max(1, limit), 500))}
 
+    from demo import register_demo          # public website demo (see demo.py)
+    register_demo(app, settings, upstream, client_ip, clock)
+
     return app
