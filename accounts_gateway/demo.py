@@ -20,6 +20,7 @@ Env vars (all optional):
 """
 import hashlib
 import json
+import logging
 import os
 import re
 import secrets
@@ -29,6 +30,11 @@ import time
 import httpx
 from fastapi import Body, Request
 from fastapi.responses import JSONResponse, Response
+
+log = logging.getLogger("demo")
+log.setLevel(logging.INFO)
+if not log.handlers:
+    log.addHandler(logging.StreamHandler())      # shows up in Railway logs
 
 SOL_MODES = ({}, {"game_mode": 1, "game_rule": 4})
 NAME_RE = re.compile(r"^[\w .\-\[\]]{2,24}$", re.UNICODE)
@@ -162,6 +168,7 @@ def register_demo(app, settings, upstream, client_ip, clock=time.time):
                              per_ip - rec["ok"])
             if not upstream:
                 rec["tries"] -= 1
+                log.error("demo: no upstream configured (set PLAYERAPI_URL and PLAYERAPI_SECRET)")
                 return err(request, 503, "unavailable", left)
             if state["global"] >= daily_cap:
                 rec["tries"] -= 1
@@ -172,6 +179,7 @@ def register_demo(app, settings, upstream, client_ip, clock=time.time):
             status, payload = upstream.post("/player/search", {"search_player_nick": name})
             players = (payload or {}).get("player_info") if status == 200 and _ok(payload) else None
             if status != 200:
+                log.error("demo: /player/search returned HTTP %s: %s", status, json.dumps(payload)[:300])
                 return err(request, 502, "unavailable", left)
             if not players:
                 return err(request, 404, "not_found", left)
@@ -185,10 +193,12 @@ def register_demo(app, settings, upstream, client_ip, clock=time.time):
                 if st == 200 and _ok(body) and (body.get("sol_data") or {}).get("total_fight"):
                     career = body
                     break
-        except (httpx.HTTPError, ValueError, AttributeError, TypeError):
+        except (httpx.HTTPError, ValueError, AttributeError, TypeError) as exc:
+            log.exception("demo: upstream call failed (%s)", type(exc).__name__)
             return err(request, 502, "unavailable", left)
 
         if career is None:
+            log.warning("demo: found player %s but no career stats", pid)
             return err(request, 404, "no_stats", left)
         player = summarize(info, career)
         with lock:
